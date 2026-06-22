@@ -73,8 +73,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self.vllm_config.speculative_config.dynamic_verifying_min_length
         self.dyn_verify_min_batch_size = \
             self.vllm_config.speculative_config.dynamic_verifying_min_batch_size
-        if self.dynamic_verifying_method == 'auto':
-            self.dynamic_verifying_min_length = 1
+        if self.dyn_verify_method == 'auto':
+            self.dyn_verify_min_length = 1
         self.num_valid_draft_tokens = None
 
         self.dflash_causal = self.dflash_config.get("causal", False)
@@ -358,24 +358,24 @@ class DFlashProposer(SpecDecodeBaseProposer):
     
     def _should_dynamic_verify(self, hidden_states: torch.Tensor) -> bool:
         """Check whether dynamic verifying should be activated this step."""
-        if not self.dynamic_verifying_method:
+        if not self.dyn_verify_method:
             return False
         if self.num_speculative_tokens <= 3:
             return False
         bs = hidden_states.shape[0] // self.num_speculative_tokens
-        return bs > self.dynamic_verifying_min_batch_size
+        return bs > self.dyn_verify_min_batch_size
 
     def _get_dynamic_verifying_threshold(
         self, draft_confidence: torch.Tensor,
     ) -> float | torch.Tensor:
         """Compute the confidence threshold for dynamic verifying."""
-        if self.dynamic_verifying_method == "auto":
+        if self.dyn_verify_method == "auto":
             # Per-request adaptive threshold: thr_i = clamp(mean(conf_i), 0.1, 0.8).
             # Keeping high-confidence tokens and filtering out low-confidence ones.
             return (draft_confidence.mean(dim=-1, keepdim=True)
                     .clamp(min=0.1, max=0.8)
                     .expand_as(draft_confidence))
-        return self.dynamic_verifying_method
+        return self.dyn_verify_method
 
     @override
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -403,6 +403,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         threshold = self._get_dynamic_verifying_threshold(draft_confidence)
         self.num_valid_draft_tokens = self._truncate_by_confidence(
-            draft_confidence, threshold, self.dynamic_verifying_min_length,
+            draft_confidence, threshold, self.dyn_verify_min_length,
         )
         return draft_token_ids
