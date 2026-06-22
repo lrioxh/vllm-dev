@@ -73,8 +73,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self.vllm_config.speculative_config.dynamic_verifying_min_length
         self.dyn_verify_min_batch_size = \
             self.vllm_config.speculative_config.dynamic_verifying_min_batch_size
-        if self.dyn_verify_method == 'auto':
-            self.dyn_verify_min_length = 1
         self.num_valid_draft_tokens = None
 
         self.dflash_causal = self.dflash_config.get("causal", False)

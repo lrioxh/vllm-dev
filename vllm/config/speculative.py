@@ -904,10 +904,12 @@ class SpeculativeConfig:
 
         if self.method != "dflash":
             logger.warning(
-                f"dynamic_verifying is only supported with dflash for now, "
-                f"got method='{self.method}', dynamic_verifying is set to None and disabled."
+                "dynamic_verifying is only supported with dflash for now, "
+                "got method='%s', dynamic_verifying is disabled.",
+                self.method,
             )
             self.dynamic_verifying = None
+            return
 
         if isinstance(self.dynamic_verifying, str):
             if self.dynamic_verifying not in ["auto"]:
@@ -923,6 +925,7 @@ class SpeculativeConfig:
                         "verification, dynamic_verifying is set to None and disabled."
                     )
                     self.dynamic_verifying = None
+                    return
                 else:
                     raise ValueError(
                         f"dynamic_verifying float must be in (0, 1), "
@@ -933,6 +936,18 @@ class SpeculativeConfig:
                 f"dynamic_verifying must be None, a float in (0, 1), or 'auto', "
                 f"got {self.dynamic_verifying!r}."
             )
+
+        if self.dynamic_verifying == "auto":
+            # Auto mode uses per-request adaptive thresholds that can
+            # aggressively truncate; force min_length=1 to avoid
+            # over-truncation when confidence is uniformly low.
+            if self.dynamic_verifying_min_length != 1:
+                logger.info(
+                    "dynamic_verifying='auto' overrides "
+                    "dynamic_verifying_min_length to 1 (was %d).",
+                    self.dynamic_verifying_min_length,
+                )
+                self.dynamic_verifying_min_length = 1
 
         if self.dynamic_verifying_min_length > self.num_speculative_tokens:
             raise ValueError(
