@@ -99,8 +99,19 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
 
-    # DFlash configs use different indexing for the target layers, see #40727
-    pre_trained_config["dflash_config"] = {
+    # DFlash configs use different indexing for the target layers, see #40727.
+    # Existing dFlash checkpoints use legacy thresh-head names; expose only the
+    # PredLenHead names to the rest of vLLM.
+    dflash_config = {
         "mask_token_id": config_dict["mask_token_id"],
         "target_layer_ids": [i - 1 for i in aux_layer_ids],
+        "use_pred_len_head": bool(
+            config_dict.get("use_thresh_head_two_model", False)
+            and config_dict.get("thresh_head_direct_len", False)
+        ),
     }
+    if "thresh_head_bottleneck_dim" in config_dict:
+        dflash_config["pred_len_head_bottleneck_dim"] = config_dict[
+            "thresh_head_bottleneck_dim"
+        ]
+    pre_trained_config["dflash_config"] = dflash_config

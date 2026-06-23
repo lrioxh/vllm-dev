@@ -75,7 +75,41 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self.vllm_config.speculative_config.dynamic_verifying_min_batch_size
         self.num_valid_draft_tokens = None
 
-        self.dflash_causal = self.dflash_config.get("causal", False)
+        dflash_config = self.dflash_config
+        self.dflash_causal = dflash_config.get("causal", False)
+        # Existing dFlash checkpoints store the length head under thresh-head
+        # config names; map that once to the internal PredLenHead switch.
+        pred_len_enabled = bool(
+            dflash_config.get("use_thresh_head_two_model", False)
+            and dflash_config.get("thresh_head_direct_len", False)
+        )
+        self.use_pred_len_head = bool(
+            self.dyn_verify_method == "pred_len_head"
+            and pred_len_enabled
+            and hasattr(self.model, "predict_len_ratio")
+        )
+        if self.dyn_verify_method == "pred_len_head" and not self.use_pred_len_head:
+            logger.warning_once(
+                "dynamic_verifying='pred_len_head' requires legacy dflash "
+                "length-head config and a PredLenHead-enabled DFlash draft "
+                "model. Disabling dynamic verifying."
+            )
+            self.dyn_verify_method = None
+        self.pred_len_head_scale = (
+            self.vllm_config.speculative_config.pred_len_head_scale
+        )
+        self.pred_len_head_parallel = (
+            self.vllm_config.speculative_config.pred_len_head_parallel
+        )
+        # The length head is independent of LM-head logits, so it can run on a
+        # side stream and feed the existing num_valid_draft_tokens trim path.
+        self.pred_len_head_stream = (
+            torch.cuda.Stream(device=device)
+            if self.use_pred_len_head
+            and self.pred_len_head_parallel
+            and device.type == "cuda"
+            else None
+        )
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
@@ -375,20 +409,67 @@ class DFlashProposer(SpecDecodeBaseProposer):
                     .expand_as(draft_confidence))
         return self.dyn_verify_method
 
+    def _pred_lens_from_hidden(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        if (
+            not self.use_pred_len_head
+            or self.num_speculative_tokens <= 0
+        ):
+            return None
+
+        block_hidden = hidden_states.reshape(
+            -1, self.num_speculative_tokens, hidden_states.shape[-1]
+        )
+        ratios = self.model.predict_len_ratio(block_hidden)
+        if ratios is None:
+            return None
+        return (
+            ratios.squeeze(-1)
+            * self.num_speculative_tokens
+            * self.pred_len_head_scale
+        ).round().clamp(
+            self.dyn_verify_min_length, self.num_speculative_tokens
+        ).to(torch.int32)
+
+    def _greedy_sample_with_pred_len_head(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        stream = self.pred_len_head_stream
+        candidate_lens = None
+
+        if stream is not None:
+            # hidden_states was produced on the current stream. Fence the side
+            # stream before it reads those tensors, then run LM-head sampling on
+            # the main stream while PredLenHead computes candidate lengths.
+            main_stream = torch.cuda.current_stream(hidden_states.device)
+            stream.wait_stream(main_stream)
+            with torch.cuda.stream(stream):
+                candidate_lens = self._pred_lens_from_hidden(hidden_states)
+
+            draft_token_ids = super()._greedy_sample(hidden_states)
+
+            # num_valid_draft_tokens is consumed after this method returns. Wait
+            # here so scheduler trimming never observes an unfinished side stream.
+            main_stream.wait_stream(stream)
+        else:
+            candidate_lens = self._pred_lens_from_hidden(hidden_states)
+            draft_token_ids = super()._greedy_sample(hidden_states)
+
+        self.num_valid_draft_tokens = candidate_lens
+        return draft_token_ids
+
     @override
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self._should_dynamic_verify(hidden_states):
             self.num_valid_draft_tokens = None
             return super()._greedy_sample(hidden_states)
 
-        # Dynamic verifying requires full logits for confidence computation,
-        # which is incompatible with the communication-efficient local argmax.
-        assert not self.use_local_argmax_reduction, (
-            "dynamic_verifying is incompatible with "
-            "use_local_argmax_reduction (needs full logits "
-            "for confidence scores). Disable one of them."
-        )
+        if self.dyn_verify_method == "pred_len_head":
+            return self._greedy_sample_with_pred_len_head(hidden_states)
 
+        # Config validation rejects local argmax for this confidence-based path;
+        # full logits are required to compute draft confidence below.
         logits = self.model.compute_logits(hidden_states)
         max_logits, draft_token_ids = logits.max(dim=-1)
         # Numerically stable max-softmax: exp(max - logsumexp) equals

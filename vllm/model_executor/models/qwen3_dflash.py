@@ -47,6 +47,28 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+class PredLenHead(nn.Module):
+    """Predict a per-request draft length ratio from DFlash hidden states."""
+
+    def __init__(self, hidden_size: int, bottleneck_dim: int = 256) -> None:
+        super().__init__()
+        self.down = nn.Linear(hidden_size * 2, bottleneck_dim)
+        self.res = nn.Sequential(
+            nn.Linear(bottleneck_dim, bottleneck_dim),
+            nn.SiLU(),
+        )
+        self.out = nn.Linear(bottleneck_dim, 1)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat(
+            [hidden_states.mean(dim=-2), hidden_states[:, -1]],
+            dim=-1,
+        )
+        hidden = self.down(feat)
+        hidden = hidden + self.res(hidden)
+        return torch.sigmoid(self.out(hidden))
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -228,7 +250,18 @@ class DFlashQwen3Model(nn.Module):
         self.quant_config = get_draft_quant_config(vllm_config)
 
         drafter_config = getattr(self.config, "eagle_config", {})
-        drafter_config.update(getattr(self.config, "dflash_config", {}))
+        dflash_config = getattr(self.config, "dflash_config", {}) or {}
+        drafter_config.update(dflash_config)
+        # Existing dFlash checkpoints store the length head under thresh-head
+        # config names; map them once so the model only uses PredLenHead fields.
+        drafter_config["use_pred_len_head"] = bool(
+            dflash_config.get("use_thresh_head_two_model", False)
+            and dflash_config.get("thresh_head_direct_len", False)
+        )
+        if "thresh_head_bottleneck_dim" in dflash_config:
+            drafter_config["pred_len_head_bottleneck_dim"] = dflash_config[
+                "thresh_head_bottleneck_dim"
+            ]
 
         if drafter_config is not None and "use_aux_hidden_state" in drafter_config:
             self.use_aux_hidden_state = drafter_config["use_aux_hidden_state"]
@@ -282,6 +315,14 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+        self.use_pred_len_head = drafter_config.get("use_pred_len_head", False)
+        if self.use_pred_len_head:
+            bottleneck_dim = drafter_config.get(
+                "pred_len_head_bottleneck_dim", 256
+            )
+            self.pred_len_head = PredLenHead(
+                self.config.hidden_size, bottleneck_dim
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -580,6 +621,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             result = result.squeeze(0)
         return result
 
+    def predict_len_ratio(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.model.use_pred_len_head:
+            return None
+        return self.model.pred_len_head(hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
         includes_draft_id_mapping = False
@@ -595,6 +644,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 includes_draft_id_mapping = True
             elif "lm_head" not in name:
                 name = "model." + name
+            if "thresh_head_two_model" in name:
+                name = name.replace("thresh_head_two_model", "pred_len_head")
             if "embed_tokens" in name:
                 includes_embed_tokens = True
             model_weights[name] = loaded_weight

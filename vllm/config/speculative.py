@@ -263,10 +263,10 @@ class SpeculativeConfig:
         return SpeculativeConfig._acceptance_length_to_rates(length, n)
 
     dynamic_verifying: float | str | None = None
-    """Dynamic verification: truncates draft tokens based on
-    confidence. Accepts a float threshold in (0, 1) (e.g. 0.7) or the
-    literal 'auto'. None disables dynamic verifying.
-    Only applies to dflash for now."""
+    """Dynamic verification for DFlash. Accepts a float confidence threshold
+    in (0, 1), 'auto' for adaptive confidence thresholding, or
+    'pred_len_head' to use the draft model's predicted-length head.
+    None disables dynamic verifying."""
 
     dynamic_verifying_min_length: int = Field(default=1, ge=1)
     """Minimum number of draft tokens to keep per request when dynamic
@@ -274,6 +274,12 @@ class SpeculativeConfig:
     uniformly low. Only takes effect when dynamic_verifying is not None."""
 
     dynamic_verifying_min_batch_size: int = 16
+
+    pred_len_head_scale: float = Field(default=1.0, gt=0)
+    """Scale applied to PredLenHead's predicted draft length ratio."""
+
+    pred_len_head_parallel: bool = True
+    """Run PredLenHead on a side CUDA stream when possible."""
 
     draft_sample_method: DraftSampleMethod = "greedy"
     """How the draft model samples tokens. 'greedy' always picks the argmax
@@ -912,10 +918,10 @@ class SpeculativeConfig:
             return
 
         if isinstance(self.dynamic_verifying, str):
-            if self.dynamic_verifying not in ["auto"]:
+            if self.dynamic_verifying not in ["auto", "pred_len_head"]:
                 raise ValueError(
-                    f"dynamic_verifying string must be 'auto', "
-                    f"got '{self.dynamic_verifying}'."
+                    "dynamic_verifying string must be 'auto' or "
+                    f"'pred_len_head', got '{self.dynamic_verifying}'."
                 )
         elif isinstance(self.dynamic_verifying, (int, float)):
             if not 0 < self.dynamic_verifying < 1:
@@ -933,8 +939,8 @@ class SpeculativeConfig:
                     )
         else:
             raise ValueError(
-                f"dynamic_verifying must be None, a float in (0, 1), or 'auto', "
-                f"got {self.dynamic_verifying!r}."
+                "dynamic_verifying must be None, a float in (0, 1), "
+                f"'auto', or 'pred_len_head', got {self.dynamic_verifying!r}."
             )
 
         if self.dynamic_verifying == "auto":
@@ -956,11 +962,15 @@ class SpeculativeConfig:
                 f"num_speculative_tokens ({self.num_speculative_tokens})."
             )
 
-        if self.use_local_argmax_reduction:
+        if (
+            self.use_local_argmax_reduction
+            and self.dynamic_verifying != "pred_len_head"
+        ):
             raise ValueError(
-                "dynamic_verifying is incompatible with "
+                "confidence-based dynamic_verifying is incompatible with "
                 "use_local_argmax_reduction (needs full logits "
-                "for confidence scores). Disable one of them."
+                "for confidence scores). Disable one of them or use "
+                "dynamic_verifying='pred_len_head'."
             )
 
     @staticmethod
