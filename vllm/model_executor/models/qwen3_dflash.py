@@ -52,7 +52,11 @@ class PredLenHead(nn.Module):
 
     def __init__(self, hidden_size: int, bottleneck_dim: int = 256) -> None:
         super().__init__()
-        self.down = nn.Linear(hidden_size * 2, bottleneck_dim)
+        # self.down = nn.Linear(hidden_size * 2, bottleneck_dim)
+        self.down = nn.Sequential(
+            nn.Linear(hidden_size * 2, bottleneck_dim),
+            nn.SiLU(),
+        )
         self.res = nn.Sequential(
             nn.Linear(bottleneck_dim, bottleneck_dim),
             nn.SiLU(),
@@ -630,6 +634,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         return self.model.pred_len_head(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        # key remapping
+        _key_remap = [
+            ("thresh_head_two_model", "pred_len_head"),
+            ("pred_len_head.down.", "pred_len_head.down.0."),
+            ("pred_len_head.res.", "pred_len_head.res.0."),
+        ]
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
@@ -644,8 +654,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 includes_draft_id_mapping = True
             elif "lm_head" not in name:
                 name = "model." + name
-            if "thresh_head_two_model" in name:
-                name = name.replace("thresh_head_two_model", "pred_len_head")
+            for old, new in _key_remap:
+                if old in name and new not in name:
+                    name = name.replace(old, new)
             if "embed_tokens" in name:
                 includes_embed_tokens = True
             model_weights[name] = loaded_weight

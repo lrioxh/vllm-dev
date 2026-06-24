@@ -75,18 +75,16 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self.vllm_config.speculative_config.dynamic_verifying_min_batch_size
         self.num_valid_draft_tokens = None
 
-        dflash_config = self.dflash_config
-        self.dflash_causal = dflash_config.get("causal", False)
         # Existing dFlash checkpoints store the length head under thresh-head
         # config names; map that once to the internal PredLenHead switch.
         pred_len_enabled = bool(
-            dflash_config.get("use_thresh_head_two_model", False)
-            and dflash_config.get("thresh_head_direct_len", False)
+            self.dflash_config.get("use_thresh_head_two_model", False)
+            and self.dflash_config.get("thresh_head_direct_len", False)
         )
         self.use_pred_len_head = bool(
             self.dyn_verify_method == "pred_len_head"
             and pred_len_enabled
-            and hasattr(self.model, "predict_len_ratio")
+            # and hasattr(self.model, "predict_len_ratio")
         )
         if self.dyn_verify_method == "pred_len_head" and not self.use_pred_len_head:
             logger.warning_once(
@@ -110,6 +108,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
             and device.type == "cuda"
             else None
         )
+
+        self.dflash_causal = self.dflash_config.get("causal", False)
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
